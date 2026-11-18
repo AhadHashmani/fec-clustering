@@ -48,9 +48,36 @@ class FluxEquilibriumClustering:
         epsilon: float = 1e-4,
         beta: Optional[float] = None,
     ) -> None:
-        # Hint: self.k = k, self.sigma = sigma, etc.
-        raise NotImplementedError
+        self.k = k
+        self.sigma = sigma
+        self.alpha = alpha
+        self.T = T
+        self.epsilon = epsilon
+        self.beta = beta
 
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+    def _phi(self, f: np.ndarray, t: int) -> np.ndarray:
+        """Flux-aware reinforcement function phi(f) at iteration t."""
+        if t == 0 or self.beta == 0:
+            return np.ones_like(f)
+        if self.beta is None:
+            return np.log1p(f)
+        return f ** self.beta
+
+    def _outflow(self, f, w, nbr, down, t):
+        """Compute delta_ij(t): flux sent along each k-NN edge."""
+        # flux-aware edge weights, restricted to downhill edges
+        w_tilde = w * self._phi(f, t)[nbr] * down
+        denom = w_tilde.sum(axis=1)  # sum over downhill neighbours m of i
+        scale = np.zeros_like(denom)
+        np.divide(self.alpha * f, denom, out=scale, where=denom > 0)
+        return w_tilde * scale[:, None]
+
+    # ------------------------------------------------------------------ #
+    # main routine
+    # ------------------------------------------------------------------ #
     def fit(self, X: np.ndarray) -> "FluxEquilibriumClustering":
         """Compute cluster labels for *X*.
 
@@ -71,9 +98,102 @@ class FluxEquilibriumClustering:
 
         The final labels must be stored in ``self.labels``.
         """
-        # Hint: Start with computing centroid = X.mean(axis=0)
+        X = np.asarray(X, dtype=float)
+        if X.ndim != 2 or X.shape[0] == 0:
+            raise ValueError("X must be a non-empty 2-D array of shape (n, m)")
+        n = X.shape[0]
 
-        # Add your code here
+        # ---- Step 1: pre-compute ----------------------------------------
+        centroid = X.mean(axis=0)
+        d = np.linalg.norm(X - centroid, axis=1)  # distance to centroid
+
+        diff = X[:, None, :] - X[None, :, :]
+        D2 = (diff ** 2).sum(axis=2)  # pairwise squared distances
+        D = np.sqrt(D2)
+
+        if self.sigma is not None:
+            sigma = float(self.sigma)
+        elif n > 1:
+            sigma = 0.2 * float(np.median(D[np.triu_indices(n, k=1)]))
+        else:
+            sigma = 1.0
+        if not sigma > 0:  # all points identical (or user gave sigma <= 0)
+            sigma = 1.0
+        tau = 0.1 * sigma
+
+        k_eff = min(self.k, n - 1)
+
+        # k nearest neighbours of each node (self excluded), nearest first
+        D2_nosel = D2.copy()
+        np.fill_diagonal(D2_nosel, np.inf)
+        nbr = np.argsort(D2_nosel, axis=1, kind="stable")[:, :k_eff]
+        rows = np.arange(n)[:, None]
+        w_ij = np.exp(-D2[rows, nbr] / sigma ** 2)  # shape (n, k_eff)
+
+        # relaxed downhill mask for every edge (i -> nbr[i, j])
+        down = d[nbr] <= d[:, None] + tau
+
+        # ---- Step 2: initialise flux ------------------------------------
+        flux = np.ones(n)
+
+        # ---- Step 3: simulate flow --------------------------------------
+        delta = np.zeros((n, k_eff))
+        for t in range(self.T):
+            delta = self._outflow(flux, w_ij, nbr, down, t)
+            incoming = np.zeros(n)
+            np.add.at(incoming, nbr.ravel(), delta.ravel())
+            flux = flux - delta.sum(axis=1) + incoming
+
+        # ---- Step 4: detect sinks ---------------------------------------
+        out_final = delta.sum(axis=1)
+        sinks = out_final < self.epsilon
+        if not sinks.any():
+            sinks[np.argmin(d)] = True
+
+        # ---- Step 5: assign clusters with cycle detection ---------------
+        if k_eff > 0:
+            steepest = nbr[np.arange(n), np.argmax(delta, axis=1)]
+            steepest = np.where(delta.max(axis=1) > 0, steepest, -1)
+        else:
+            steepest = -np.ones(n, dtype=int)
+
+        labels = -np.ones(n, dtype=int)
+        sink_idx = np.flatnonzero(sinks)
+        labels[sink_idx] = np.arange(len(sink_idx))
+        next_label = len(sink_idx)
+
+        for i in range(n):
+            if labels[i] != -1:
+                continue
+            path, on_path = [], set()
+            cur = i
+            while labels[cur] == -1:
+                if cur in on_path:  # closed cycle -> break it with a new sink
+                    labels[cur] = next_label
+                    next_label += 1
+                    break
+                on_path.add(cur)
+                path.append(cur)
+                nxt = steepest[cur]
+                if nxt < 0:  # no outgoing flux at all: treat as its own sink
+                    labels[cur] = next_label
+                    next_label += 1
+                    break
+                cur = nxt
+            labels[path] = labels[cur]
+
+        # ---- Step 6: merge small clusters -------------------------------
+        s_min = max(2, n // 20)
+        uniq, counts = np.unique(labels, return_counts=True)
+        large = uniq[counts >= s_min]
+        small = uniq[counts < s_min]
+        if len(large) > 0 and len(small) > 0:
+            cents = {lab: X[labels == lab].mean(axis=0) for lab in uniq}
+            merged = labels.copy()
+            for lab in small:
+                dists = [np.linalg.norm(cents[lab] - cents[big]) for big in large]
+                merged[labels == lab] = large[int(np.argmin(dists))]
+            labels = merged
 
         # ---- DO NOT CHANGE THE REST OF THIS METHOD ---- #
         # We require you maintain these attributes for testing purpose.
